@@ -1,7 +1,7 @@
 ;; AUTOMATED INSURANCE CLAIMS CONTRACT
 ;; A parametric insurance contract that automatically processes claims 
 ;; based on predefined weather conditions using oracle data
-;; =============================================================================
+
 ;; ERROR CONSTANTS
 (define-constant ERR-NOT-AUTHORIZED u1)
 (define-constant ERR-POLICY-NOT-FOUND u2)
@@ -20,7 +20,6 @@
 (define-constant ERR-NOT-CLAIMABLE-YET u15)
 (define-constant ERR-PAYMENT-FAILED u16)
 (define-constant ERR-POLICY-NOT-EXPIRED u17)
-
 ;; STATUS CONSTANTS
 ;; Policy Status Values
 (define-constant POLICY-STATUS-ACTIVE u1)
@@ -46,7 +45,6 @@
 (define-constant OPERATOR-EQUAL-TO u3)
 (define-constant OPERATOR-GREATER-THAN-OR-EQUAL u4)
 (define-constant OPERATOR-LESS-THAN-OR-EQUAL u5)
-;; =============================================================================
 ;; STATE VARIABLES
 (define-data-var contract-owner principal tx-sender)
 (define-data-var next-policy-id uint u1)
@@ -54,7 +52,6 @@
 (define-data-var treasury-balance uint u0)
 (define-data-var total-premiums-collected uint u0)
 (define-data-var total-claims-paid uint u0)
-;; =============================================================================
 ;; DATA MAPS
 ;; Oracle Registry - Stores registered oracle information
 (define-map oracle-registry
@@ -150,7 +147,7 @@
   { user: principal, index: uint }
   { policy-id: uint }
 )
-;; =============================================================================
+
 ;; READ-ONLY FUNCTIONS - Data Retrieval
 ;; Get complete policy information by ID
 (define-read-only (get-policy (policy-id uint))
@@ -180,7 +177,6 @@
 (define-read-only (get-policy-condition (policy-id uint) (condition-index uint))
   (map-get? policy-conditions { policy-id: policy-id, condition-index: condition-index })
 )
-;; =============================================================================
 ;; READ-ONLY FUNCTIONS - Business Logic
 ;; Calculate premium for given parameters
 (define-read-only (calculate-premium (profile-id uint) (coverage-amount uint) (location (string-utf8 100)))
@@ -291,7 +287,6 @@
 (define-read-only (get-user-policy-count (user principal))
   (default-to u0 (get count (map-get? user-policy-count { user: user })))
 )
-;; =============================================================================
 ;; PUBLIC FUNCTIONS - Oracle Management
 ;; Register a new oracle (only contract owner)
 (define-public (register-oracle
@@ -322,6 +317,7 @@
     (ok oracle-id)
   )
 )
+
 ;; Submit oracle data (only registered oracles)
 (define-public (submit-oracle-data
   (oracle-id (string-ascii 36))
@@ -336,7 +332,7 @@
     ;; Verify oracle is active and caller is authorized
     (asserts! (get is-active oracle-info) (err ERR-ORACLE-NOT-REGISTERED))
     (asserts! (is-eq tx-sender (get oracle-principal oracle-info)) (err ERR-NOT-AUTHORIZED))
-    
+
     ;; Store oracle data
     (map-set oracle-data
       { oracle-id: oracle-id, data-block: block-height }
@@ -347,11 +343,11 @@
         timestamp: block-height
       }
     )
-    
+
     (ok true)
   )
 )
-;; =============================================================================
+
 ;; PUBLIC FUNCTIONS - Risk Profile Management
 ;; Create a new risk profile (only contract owner)
 (define-public (create-risk-profile
@@ -389,7 +385,6 @@
     (ok profile-id)
   )
 )
-;; =============================================================================
 ;; HELPER FUNCTIONS - Policy Management
 ;; Helper function to update user policy tracking
 (define-private (update-user-policy-tracking (user principal) (policy-id uint))
@@ -408,4 +403,133 @@
 
     new-count
   )
+)
+
+
+
+;; Create a new insurance policy
+(define-public (create-policy
+ (risk-profile-id uint)
+ (coverage-amount uint)
+ (duration-blocks uint)
+ (auto-renew bool)
+ (location (string-utf8 100))
+)
+ (let
+  (
+     (policy-id (var-get next-policy-id))
+     (risk-profile (unwrap! (get-risk-profile risk-profile-id) (err ERR-INVALID-RISK-PROFILE)))
+     (premium-result (unwrap! (calculate-premium risk-profile-id coverage-amount location) (err ERR-INVALID-PARAMETERS)))
+   )
+
+   ;; Validate coverage amount
+   (asserts! (and
+              (>= coverage-amount (get min-coverage risk-profile))
+              (<= coverage-amount (get max-coverage risk-profile))
+             )
+             (err ERR-INVALID-COVERAGE-AMOUNT))
+
+   ;; Collect premium payment
+   (try! (stx-transfer? premium-result tx-sender (as-contract tx-sender)))
+
+   ;; Update treasury
+   (var-set treasury-balance (+ (var-get treasury-balance) premium-result))
+   (var-set total-premiums-collected (+ (var-get total-premiums-collected) premium-result))
+
+   ;; Create policy
+   (map-set policies
+     { policy-id: policy-id }
+     {
+       policyholder: tx-sender,
+       risk-profile-id: risk-profile-id,
+       coverage-amount: coverage-amount,
+       premium-amount: premium-result,
+       start-block: block-height,
+       end-block: (+ block-height duration-blocks),
+       policy-status: POLICY-STATUS-ACTIVE,
+       renewal-count: u0,
+       auto-renew: auto-renew,
+       location: location,
+       created-at: block-height,
+       last-updated: block-height
+     }
+   )
+
+   ;; Update user policy tracking
+   (match (map-get? user-policy-count { user: tx-sender })
+     existing-count
+     (let
+       (
+         (new-count (+ (get count existing-count) u1))
+       )
+       (map-set user-policy-count
+         { user: tx-sender }
+         { count: new-count }
+       )
+       (map-set user-policies
+         { user: tx-sender, index: (- new-count u1) }
+         { policy-id: policy-id }
+       )
+     )
+     (begin
+       (map-set user-policy-count
+         { user: tx-sender }
+         { count: u1 }
+       )
+       (map-set user-policies
+         { user: tx-sender, index: u0 }
+         { policy-id: policy-id }
+       )
+     )
+   )
+
+   ;; Increment policy ID counter
+   (var-set next-policy-id (+ policy-id u1))
+
+   (ok policy-id)
+ )
+)
+
+
+;; Add a condition to policy
+(define-public (add-policy-condition
+ (policy-id uint)
+ (weather-type uint)
+ (operator uint)
+ (threshold-value uint)
+ (payout-percentage uint)
+(oracle-id (string-ascii 36))
+)
+ (let
+   (
+     (policy (unwrap! (get-policy policy-id) (err ERR-POLICY-NOT-FOUND)))
+     (condition-index u0) ;; For simplicity, we only allow one condition per policy
+   )
+
+   ;; Check if caller is policy holder
+   (asserts! (is-eq tx-sender (get policyholder policy)) (err ERR-NOT-AUTHORIZED))
+
+   ;; Check if policy is active
+   (asserts! (is-eq (get policy-status policy) POLICY-STATUS-ACTIVE) (err ERR-POLICY-NOT-ACTIVE))
+
+   ;; Check if oracle exists
+   (asserts! (is-some (get-oracle oracle-id)) (err ERR-ORACLE-NOT-REGISTERED))
+
+   ;; Validate payout percentage (max 100%)
+   (asserts! (<= payout-percentage u10000) (err ERR-INVALID-PARAMETERS))
+
+   ;; Add condition
+   (map-set policy-conditions
+     { policy-id: policy-id, condition-index: condition-index }
+     {
+       weather-type: weather-type,
+       operator: operator,
+       threshold-value: threshold-value,
+       payout-percentage: payout-percentage,
+       oracle-id: oracle-id
+     }
+   )
+
+   (ok true)
+ )
 )
